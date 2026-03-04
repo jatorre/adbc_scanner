@@ -98,6 +98,17 @@ struct AdbcScanGlobalState : public GlobalTableFunctionState {
     ArrowTableSchema projected_arrow_table;
     bool has_projected_schema = false;
 
+    // For adbc_scan: projection_ids for removing filter-only columns from output.
+    // When DuckDB applies filters after the scan (filter_pushdown = false), it may request
+    // extra columns via column_ids and use projection_ids to map back to output columns.
+    // See ArrowScanGlobalState::CanRemoveFilterColumns() in DuckDB's arrow.hpp.
+    vector<idx_t> projection_ids;
+    vector<LogicalType> scanned_types;
+
+    bool CanRemoveFilterColumns() const {
+        return !projection_ids.empty();
+    }
+
     ~AdbcScanGlobalState() {
         if (stream_initialized && stream.release) {
             stream.release(&stream);
@@ -506,6 +517,9 @@ static unique_ptr<FunctionData> AdbcScanBind(ClientContext &context, TableFuncti
     // Populate return types and names from Arrow schema
     PopulateReturnTypesFromSchema(context, *bind_data, return_types, names);
 
+    // Store return types for projection_ids support (needed to build scanned_types in InitGlobal)
+    bind_data->return_types = return_types;
+
     return std::move(bind_data);
 }
 
@@ -562,6 +576,22 @@ static unique_ptr<GlobalTableFunctionState> AdbcScanInitGlobal(ClientContext &co
         global_state->rows_affected = rows_affected;
     }
 
+    // Store projection_ids for handling filter-only columns.
+    // When DuckDB applies post-scan filters (filter_pushdown = false), it may add extra
+    // columns to column_ids for filtering and provide projection_ids to map the scanned
+    // columns back to the output columns. Without this, ArrowToDuckDB writes into output
+    // columns with mismatched types, causing a crash.
+    if (!input.projection_ids.empty()) {
+        global_state->projection_ids = input.projection_ids;
+        for (const auto &col_idx : input.column_ids) {
+            if (col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+                global_state->scanned_types.emplace_back(LogicalType::ROW_TYPE);
+            } else {
+                global_state->scanned_types.push_back(bind_data.return_types[col_idx]);
+            }
+        }
+    }
+
     return std::move(global_state);
 }
 
@@ -575,6 +605,14 @@ static unique_ptr<LocalTableFunctionState> AdbcScanInitLocal(ExecutionContext &c
     // ArrowToDuckDB uses these to map output column indices to Arrow array child indices
     for (auto &col_id : input.column_ids) {
         local_state->column_ids.push_back(col_id);
+    }
+
+    // Initialize all_columns DataChunk when projection_ids are present.
+    // This intermediate chunk holds all scanned columns (including filter-only columns)
+    // before ReferenceColumns selects only the output columns.
+    if (!input.projection_ids.empty()) {
+        auto &global_state = global_state_p->Cast<AdbcScanGlobalState>();
+        local_state->all_columns.Initialize(context.client, global_state.scanned_types);
     }
 
     return std::move(local_state);
@@ -636,16 +674,32 @@ static void AdbcScanFunction(ClientContext &context, TableFunctionInput &data, D
     idx_t output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE,
                                          local_state.chunk->arrow_array.length - local_state.chunk_offset);
 
-    output.SetCardinality(output_size);
-
     // Convert Arrow data to DuckDB using ArrowTableFunction::ArrowToDuckDB
     // arrow_scan_is_projected = false because the ADBC driver returns all columns,
-    // but ArrowToDuckDB will use local_state.column_ids to extract only the needed columns
+    // but ArrowToDuckDB will use local_state.column_ids to extract only the needed columns.
+    //
+    // When DuckDB applies post-scan filters (filter_pushdown = false), it may reorder
+    // column_ids and add filter-only columns. In this case, we scan all requested columns
+    // into all_columns first, then use ReferenceColumns to select only output columns.
+    // This matches DuckDB's built-in arrow_scan behavior (see ArrowScanFunction in arrow.cpp).
     if (output_size > 0) {
-        ArrowTableFunction::ArrowToDuckDB(local_state,
-                                          bind_data.arrow_table.GetColumns(),
-                                          output,
-                                          false);
+        if (global_state.CanRemoveFilterColumns()) {
+            local_state.all_columns.Reset();
+            local_state.all_columns.SetCardinality(output_size);
+            ArrowTableFunction::ArrowToDuckDB(local_state,
+                                              bind_data.arrow_table.GetColumns(),
+                                              local_state.all_columns,
+                                              false);
+            output.ReferenceColumns(local_state.all_columns, global_state.projection_ids);
+        } else {
+            output.SetCardinality(output_size);
+            ArrowTableFunction::ArrowToDuckDB(local_state,
+                                              bind_data.arrow_table.GetColumns(),
+                                              output,
+                                              false);
+        }
+    } else {
+        output.SetCardinality(0);
     }
 
     local_state.chunk_offset += output.size();
