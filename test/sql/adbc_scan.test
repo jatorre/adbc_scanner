@@ -258,6 +258,104 @@ SELECT COUNT(*) FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM nu
 ----
 3
 
+# ============================================
+# Projection IDs / Filter on Non-Projected Column Tests
+# ============================================
+# These tests verify the fix for projection_ids handling in AdbcScanFunction.
+# When adbc_scan is used with a WHERE clause on a column NOT in the SELECT list,
+# DuckDB adds that column to column_ids for filtering and uses projection_ids
+# to map back to output columns. Without proper handling, this causes a crash
+# due to type mismatches in ArrowToDuckDB.
+
+# Filter on a column not in the output (col02 is REAL, not in SELECT)
+query IT
+SELECT col00, col01 FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col02 >= 100.0 ORDER BY col00;
+----
+100	b0
+200	c0
+
+# Filter on a later column not in output, select early columns
+query IR
+SELECT col00, col02 FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col09 > 100 ORDER BY col00;
+----
+100	100.0
+200	200.0
+
+# Filter on TEXT column not in output
+query IR
+SELECT col00, col05 FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col07 = 'b6';
+----
+100	105.5
+
+# Select only one column, filter on a completely different column
+query T
+SELECT col28 FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col03 > 150;
+----
+c28
+
+# Select last column, filter on first column
+query R
+SELECT col29 FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col00 = 0;
+----
+29.29
+
+# Select first column, filter on last column
+query I
+SELECT col00 FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col29 > 200.0;
+----
+200
+
+# Multiple filters on non-projected columns
+query IT
+SELECT col00, col01 FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col05 > 100.0 AND col09 < 150 ORDER BY col00;
+----
+100	b0
+
+# Aggregation with filter on non-projected column
+query I
+SELECT COUNT(*) FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col09 > 50;
+----
+2
+
+query IR
+SELECT COUNT(*), SUM(col00) FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM wide_table') WHERE col02 >= 100.0;
+----
+2	300
+
+# Filter on non-projected column with large result set
+query I
+SELECT SUM(c0) FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM large_wide') WHERE c5 > 5000;
+----
+37517490
+
+query II
+SELECT COUNT(*), SUM(c0) FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM large_wide') WHERE c9 < 100;
+----
+91	4095
+
+# Filter on one non-projected column, select a different non-adjacent column
+query I
+SELECT c0 FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM large_wide') WHERE c5 = 10 AND c9 = 14;
+----
+5
+
+# Filter on non-projected column with NULL values
+query I
+SELECT a FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM null_test') WHERE e = 'e3';
+----
+3
+
+query IT
+SELECT a, b FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM null_test') WHERE d IS NULL ORDER BY a;
+----
+1	NULL
+
+query IT
+SELECT a, b FROM adbc_scan(getvariable('conn_id')::BIGINT, 'SELECT * FROM null_test') WHERE c IS NOT NULL ORDER BY a;
+----
+1	NULL
+3	b3
+
 # Clean up
 statement ok
 SELECT adbc_disconnect(getvariable('conn_id')::BIGINT);
