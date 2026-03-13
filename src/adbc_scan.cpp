@@ -585,7 +585,7 @@ static unique_ptr<GlobalTableFunctionState> AdbcScanInitGlobal(ClientContext &co
         global_state->projection_ids = input.projection_ids;
         for (const auto &col_idx : input.column_ids) {
             if (col_idx == COLUMN_IDENTIFIER_ROW_ID) {
-                global_state->scanned_types.emplace_back(LogicalType::ROW_TYPE);
+                global_state->scanned_types.emplace_back(LogicalType(LogicalTypeId::BIGINT));
             } else {
                 global_state->scanned_types.push_back(bind_data.return_types[col_idx]);
             }
